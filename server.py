@@ -63,8 +63,12 @@ def stop_recording():
     return jsonify({"status": "Recording stopped", "uid": last_scanned_uid})
 
 def save_audio_file():
-    """Saves recorded audio as a WAV file."""
+    """Saves recorded audio with proper volume normalization."""
     global recorded_audio, last_scanned_uid
+
+    if not recorded_audio:
+        print("[Error] No audio data recorded.")
+        return
 
     if not os.path.exists(RECORDINGS_DIR):
         os.makedirs(RECORDINGS_DIR)
@@ -72,7 +76,6 @@ def save_audio_file():
     base_filename = f"{last_scanned_uid}.wav"
     filepath = os.path.join(RECORDINGS_DIR, base_filename)
 
-    # Ensure filename is unique
     if os.path.exists(filepath):
         counter = 1
         while os.path.exists(os.path.join(RECORDINGS_DIR, f"{last_scanned_uid}_{counter}.wav")):
@@ -80,18 +83,24 @@ def save_audio_file():
         filepath = os.path.join(RECORDINGS_DIR, f"{last_scanned_uid}_{counter}.wav")
 
     try:
+        # Convert recorded data into numpy array
         audio_data = np.concatenate(recorded_audio, axis=0)
+
+        # Normalize to full range (-32768 to 32767)
+        audio_data = np.int16(audio_data * (32767 / max(1, np.max(np.abs(audio_data)))))
 
         with wave.open(filepath, 'wb') as wf:
             wf.setnchannels(1)        # Mono
             wf.setsampwidth(2)        # 16-bit
-            wf.setframerate(44100)    # Sample rate
+            wf.setframerate(44100)    # 44.1 kHz
             wf.writeframes(audio_data.tobytes())
 
-        print(f"[Server] Audio saved: {filepath}")
+        print(f"[Server] Audio saved successfully: {filepath}")
 
     except Exception as e:
         print(f"[Error] Could not save audio: {e}")
+
+
 
 @app.route("/status", methods=["GET"])
 def get_status():

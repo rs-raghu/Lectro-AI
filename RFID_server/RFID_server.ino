@@ -12,8 +12,16 @@
 const char* ssid = "RS Raghu";
 const char* password = "6380779185";
 
-// Flask server address (change this to your Flask server IP)
+// Flask server address
 const char* cloudServer = "http://192.168.223.115:5000";
+
+// List of authorized RFID UIDs
+const char* authorizedUIDs[] = {
+    "53cb1229",  // Example UID 1
+    "aabbccdd",  // Example UID 2
+    "deadbeef"   // Example UID 3
+};
+const int numAuthorizedUIDs = sizeof(authorizedUIDs) / sizeof(authorizedUIDs[0]);
 
 // Initialize RFID and Web Server
 MFRC522 rfid(SS_PIN, RST_PIN);
@@ -29,6 +37,16 @@ String getScannedUID() {
         uid += String(rfid.uid.uidByte[i], HEX);
     }
     return uid;
+}
+
+// Function to check if scanned UID is authorized
+bool isAuthorized(String scannedUID) {
+    for (int i = 0; i < numAuthorizedUIDs; i++) {
+        if (scannedUID.equalsIgnoreCase(authorizedUIDs[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Function to send HTTP request to Flask server
@@ -122,6 +140,12 @@ void loop() {
     lastScannedUID = getScannedUID();
     Serial.print("[RFID] Scanned UID: ");
     Serial.println(lastScannedUID);
+
+    // Check if UID is authorized before proceeding
+    if (!isAuthorized(lastScannedUID)) {
+        Serial.println("[RFID] Unauthorized UID! Access Denied.");
+        return;
+    }
 
     // Toggle recording state
     if (!isRecording) {
