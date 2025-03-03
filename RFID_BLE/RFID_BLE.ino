@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <SPI.h>
 #include <MFRC522.h>
@@ -8,22 +9,15 @@
 
 const char* ssid = "RS Raghu";
 const char* password = "6380779185";
+const char* cloudServer = "http://192.168.238.115:5000";
+  // Laptop's Flask Server IP
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 WebServer server(80);
 
-unsigned long scanStopTime = 0;
-const unsigned long stopDuration = 10000; // 10 seconds
-
-String activeSessionID = "";
 bool isRecording = false;
-String lastScannedUID = "None"; // Store last scanned UID
+String lastScannedUID = "None"; 
 
-// List of authorized UIDs
-const String authorizedUIDs[] = {"53cb1229", "a9967db"};  
-const int numAuthorizedUIDs = sizeof(authorizedUIDs) / sizeof(authorizedUIDs[0]);
-
-// Webpage with JavaScript auto-refresh
 void handleRoot() {
     String html = "<html><head>"
                   "<script>"
@@ -33,8 +27,7 @@ void handleRoot() {
                   "   document.getElementById('rfidDisplay').innerHTML = parts[0];"
                   "   document.getElementById('statusDisplay').innerHTML = parts[1];"
                   " });"
-                  "}"
-                  "setInterval(updateStatus, 1000);" // Refresh every second
+                  "} setInterval(updateStatus, 1000);"
                   "</script>"
                   "</head><body>"
                   "<h1>ESP32 Web Server</h1>"
@@ -45,7 +38,6 @@ void handleRoot() {
     server.send(200, "text/html", html);
 }
 
-// Return last scanned RFID & recording status
 void handleRFIDStatus() {
     String status = isRecording ? "Recording in Progress" : "Stopped";
     server.send(200, "text/plain", lastScannedUID + "," + status);
@@ -53,16 +45,25 @@ void handleRFIDStatus() {
 
 void setup() {
     Serial.begin(115200);
+    while (!Serial); // Ensure Serial Monitor is ready
+    Serial.println("\n\nBooting ESP32...");
+
+    delay(2000); // Wait to make sure ESP32 is ready
+
     SPI.begin();
+    Serial.println("SPI initialized.");
+    
     rfid.PCD_Init();
+    Serial.println("RFID module initialized.");
 
     WiFi.begin(ssid, password);
-    Serial.print("Connecting to WiFi...");
+    Serial.print("Connecting to WiFi");
+    
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
-    Serial.println("\nConnected!");
+    Serial.println("\nWiFi Connected!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
 
@@ -70,27 +71,19 @@ void setup() {
     server.on("/rfid-status", handleRFIDStatus);
     server.begin();
     Serial.println("Web Server Started!");
+
+    Serial.flush(); // Ensure Serial prints are actually sent
 }
+
+
 
 void loop() {
     server.handleClient();
-
-    if (millis() < scanStopTime) {
-        return;
-    }
-
-    if (scanStopTime != 0 && millis() >= scanStopTime) {
-        Serial.println("Session ended. Resuming scanning...");
-        activeSessionID = "";  
-        scanStopTime = 0;
-        isRecording = false;
-    }
 
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
         return;
     }
 
-    // Read UID and convert to string
     lastScannedUID = "";
     for (byte i = 0; i < rfid.uid.size; i++) {
         lastScannedUID += String(rfid.uid.uidByte[i], HEX);
@@ -100,37 +93,44 @@ void loop() {
     Serial.print("Scanned UID: ");
     Serial.println(lastScannedUID);
 
-    // Check authorization
-    bool isAuthorized = false;
-    for (int i = 0; i < numAuthorizedUIDs; i++) {
-        if (lastScannedUID == authorizedUIDs[i]) {
-            isAuthorized = true;
-            break;
-        }
-    }
+    if (!isRecording) {
+    Serial.println("Starting recording...");
+    isRecording = sendToCloud("/start", lastScannedUID);
+} else {
+    Serial.println("Stopping recording...");
+    isRecording = !sendToCloud("/stop", lastScannedUID);
+}
 
-    if (isAuthorized) {
-        if (activeSessionID == "") { 
-            Serial.println("Authentication successful! Starting recording...");
-            activeSessionID = lastScannedUID;
-            isRecording = true;
-        } 
-        else if (activeSessionID == lastScannedUID) { 
-            Serial.println("Same ID detected. Pausing for 10 seconds...");
-            scanStopTime = millis() + stopDuration;
-            isRecording = false;
-        } 
-        else { 
-            Serial.println("Another ID in progress! Wait for session to end.");
-        }
-    } 
-    else {
-        Serial.println("Authentication failed!");
-    }
 
-    // Immediately update web status
-    handleRFIDStatus();
+    handleRFIDStatus(); // Update web UI immediately
 
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
 }
+
+// ✅ Use HTTPClient for API calls
+bool sendToCloud(String endpoint, String scannedUID) {
+    HTTPClient http;
+    String fullURL = String(cloudServer) + endpoint;
+
+    Serial.print("Sending request to: ");
+    Serial.println(fullURL);
+
+    http.begin(fullURL);
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"uid\": \"" + scannedUID + "\"}";
+    int httpCode = http.POST(payload);
+
+    if (httpCode > 0) {
+        Serial.println("Server Response: " + http.getString());
+        http.end();
+        return true;
+    } else {
+        Serial.println("Failed to reach server!");
+        http.end();
+        return false;
+    }
+}
+
+
