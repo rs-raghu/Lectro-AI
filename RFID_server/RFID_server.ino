@@ -13,7 +13,7 @@ const char* ssid = "RS Raghu";
 const char* password = "6380779185";
 
 // Flask server address
-const char* cloudServer = "http://192.168.223.115:5000";
+const char* cloudServer = "http://192.168.219.115:5000";
 
 // List of authorized RFID UIDs
 const char* authorizedUIDs[] = {
@@ -59,17 +59,18 @@ bool sendToCloud(String endpoint, String scannedUID) {
 
     http.begin(fullURL);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(5000);
+    http.setTimeout(15000);  // Increase timeout for slow networks
 
     String payload = "{\"uid\": \"" + scannedUID + "\"}";
     int httpCode = http.POST(payload);
 
-    if (httpCode > 0) {
-        Serial.println("[HTTP] Response: " + http.getString());
+    if (httpCode == 200) {  // Ensure only successful responses count
+        Serial.println("[HTTP] Recording toggled successfully!");
         http.end();
         return true;
     } else {
-        Serial.println("[HTTP] Request Failed!");
+        Serial.print("[HTTP] Request Failed! Code: ");
+        Serial.println(httpCode);
         http.end();
         return false;
     }
@@ -141,22 +142,14 @@ void loop() {
     Serial.print("[RFID] Scanned UID: ");
     Serial.println(lastScannedUID);
 
-    // Check if UID is authorized before proceeding
     if (!isAuthorized(lastScannedUID)) {
         Serial.println("[RFID] Unauthorized UID! Access Denied.");
         return;
     }
 
-    // Toggle recording state
-    if (!isRecording) {
-        Serial.println("[RFID] Starting Recording...");
-        isRecording = sendToCloud("/start", lastScannedUID);
-    } else {
-        Serial.println("[RFID] Stopping Recording...");
-        isRecording = !sendToCloud("/stop", lastScannedUID);
-    }
+    isRecording = !isRecording ? sendToCloud("/start", lastScannedUID) : !sendToCloud("/stop", lastScannedUID);
 
-    handleRFIDStatus();
+    delay(2000);  // Prevent multiple rapid scans
 
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();

@@ -1,111 +1,99 @@
+import os
 import sounddevice as sd
 import numpy as np
-import wave
-import threading
-import time
-import os
-from flask import Flask, jsonify, request
+import wave 
+from flask import Flask, request, jsonify
+from threading import Thread
+
+# Base recordings folder
+BASE_RECORDINGS_FOLDER = os.path.abspath("recordings")
+os.makedirs(BASE_RECORDINGS_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
 
-# Global variables
-is_recording = False
-last_scanned_uid = "None"
-recording_thread = None
-recorded_audio = []
-RECORDINGS_DIR = "recordings"
+# Recording settings
+SAMPLE_RATE = 44100
+CHANNELS = 1
+RECORDING = []
+RECORDING_ACTIVE = False
+CURRENT_TEACHER_ID = None
 
-# Function to record audio
-def record_audio():
-    """Continuously records audio while is_recording is True."""
-    global recorded_audio
+def get_next_filename(teacher_id):
+    """Generate the next available filename for a teacher's recordings."""
+    teacher_folder = os.path.join(BASE_RECORDINGS_FOLDER, teacher_id)
+    os.makedirs(teacher_folder, exist_ok=True)
     
-    with sd.InputStream(samplerate=44100, channels=1, dtype=np.int16) as stream:
-        while is_recording:
-            data, overflowed = stream.read(1024)
-            recorded_audio.append(data)
-            time.sleep(0.01)
+    i = 1
+    while os.path.exists(os.path.join(teacher_folder, f"{teacher_id}{i}.wav")):
+        i += 1
+    
+    return os.path.join(teacher_folder, f"{teacher_id}{i}.wav")
 
-@app.route("/", methods=["GET"])
-def home():
-    """Check if the Flask server is running."""
-    return jsonify({"message": "Flask server is running!"})
+def start_recording():
+    """Start recording audio."""
+    global RECORDING, RECORDING_ACTIVE
+    RECORDING = []
+    RECORDING_ACTIVE = True
+    
+    def callback(indata, frames, time, status):
+        if RECORDING_ACTIVE:
+            RECORDING.append(indata.copy())
+    
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=callback):
+        while RECORDING_ACTIVE:
+            sd.sleep(100)
+
+def stop_recording():
+    """Stop recording and save audio to file."""
+    global RECORDING_ACTIVE, CURRENT_TEACHER_ID
+    RECORDING_ACTIVE = False
+    
+    if RECORDING and CURRENT_TEACHER_ID:
+        audio_data = np.concatenate(RECORDING, axis=0)
+        file_path = get_next_filename(CURRENT_TEACHER_ID)
+        
+        with wave.open(file_path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
+        
+        print(f"[Recorder] Audio saved at: {file_path}")
+        return file_path
+    return None
 
 @app.route("/start", methods=["POST"])
-def start_recording():
-    """Starts recording when an RFID card is scanned."""
-    global is_recording, last_scanned_uid, recording_thread, recorded_audio
-
+def start_recording_api():
+    """API to start recording."""
+    global CURRENT_TEACHER_ID
     data = request.get_json()
-    last_scanned_uid = data.get("uid", "Unknown")
-
-    if not is_recording:
-        is_recording = True
-        recorded_audio = []  # Clear previous data
-        recording_thread = threading.Thread(target=record_audio)
-        recording_thread.start()
-
-    return jsonify({"status": "Recording started", "uid": last_scanned_uid})
+    if not data or "uid" not in data:
+        return jsonify({"error": "Invalid request"}), 400
+    
+    CURRENT_TEACHER_ID = data["uid"]
+    Thread(target=start_recording).start()
+    print(f"[Flask] Recording started for UID: {CURRENT_TEACHER_ID}")
+    return jsonify({"message": "Recording started", "uid": CURRENT_TEACHER_ID}), 200
 
 @app.route("/stop", methods=["POST"])
-def stop_recording():
-    """Stops recording and saves the file."""
-    global is_recording
+def stop_recording_api():
+    """API to stop recording."""
+    global CURRENT_TEACHER_ID
+    data = request.get_json()
 
-    is_recording = False
-    
-    if recording_thread:
-        recording_thread.join()  # Ensure the thread stops before proceeding
+    if not data or "uid" not in data:
+        return jsonify({"error": "Invalid request"}), 400
 
-    if recorded_audio:
-        save_audio_file()
+    file_path = stop_recording()
+    if file_path:
+        print(f"[Flask] Recording stopped and saved at: {file_path}")
+        return jsonify({
+            "message": "Recording stopped",
+            "file": file_path
+        }), 200
 
-    return jsonify({"status": "Recording stopped", "uid": last_scanned_uid})
+    return jsonify({"error": "No recording found"}), 500
 
-def save_audio_file():
-    """Saves recorded audio with proper volume normalization."""
-    global recorded_audio, last_scanned_uid
-
-    if not recorded_audio:
-        print("[Error] No audio data recorded.")
-        return
-
-    if not os.path.exists(RECORDINGS_DIR):
-        os.makedirs(RECORDINGS_DIR)
-
-    base_filename = f"{last_scanned_uid}.wav"
-    filepath = os.path.join(RECORDINGS_DIR, base_filename)
-
-    if os.path.exists(filepath):
-        counter = 1
-        while os.path.exists(os.path.join(RECORDINGS_DIR, f"{last_scanned_uid}_{counter}.wav")):
-            counter += 1
-        filepath = os.path.join(RECORDINGS_DIR, f"{last_scanned_uid}_{counter}.wav")
-
-    try:
-        # Convert recorded data into numpy array
-        audio_data = np.concatenate(recorded_audio, axis=0)
-
-        # Normalize to full range (-32768 to 32767)
-        audio_data = np.int16(audio_data * (32767 / max(1, np.max(np.abs(audio_data)))))
-
-        with wave.open(filepath, 'wb') as wf:
-            wf.setnchannels(1)        # Mono
-            wf.setsampwidth(2)        # 16-bit
-            wf.setframerate(44100)    # 44.1 kHz
-            wf.writeframes(audio_data.tobytes())
-
-        print(f"[Server] Audio saved successfully: {filepath}")
-
-    except Exception as e:
-        print(f"[Error] Could not save audio: {e}")
-
-
-
-@app.route("/status", methods=["GET"])
-def get_status():
-    """Check the current recording status."""
-    return jsonify({"recording": is_recording, "uid": last_scanned_uid})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
