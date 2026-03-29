@@ -1,173 +1,248 @@
+/*
+ * RFID_server.ino — ESP32 RFID Recorder Controller
+ *
+ * Tap an authorized RFID card to start recording on the Flask server.
+ * Tap the same card again to stop.
+ *
+ * Requires: config.h in the same folder (not committed to version control)
+ * Libraries: MFRC522, WiFi, HTTPClient, WebServer (all via Arduino Library Manager)
+ */
+
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include "config.h"
 
-#define SS_PIN 5
+// ---- Pin definitions ----
+#define SS_PIN  5
 #define RST_PIN 22
 
-const char* ssid = "RS Raghu";
-const char* password = "6380779185";
+// ---- Debounce: ignore re-scans within this window ----
+#define SCAN_COOLDOWN_MS 2500
 
-// Flask server address
-const char* cloudServer = "http://192.168.114.115:5000";
-
-// List of authorized RFID UIDs (normalized to lowercase)
-const char* authorizedUIDs[] = {
-    "53cb1229", 
-    "aabbccdd", 
-    "faeebcdb"
-};
-const int numAuthorizedUIDs = sizeof(authorizedUIDs) / sizeof(authorizedUIDs[0]);
-
-MFRC522 rfid(SS_PIN, RST_PIN);
+// ---- Globals ----
+MFRC522  rfid(SS_PIN, RST_PIN);
 WebServer server(80);
 
-bool isRecording = false;
-String activeUID = "";
-String lastScannedUID = "None";
+volatile bool isRecording  = false;
+char activeUID[9]          = {0};      // UID that opened the current session
+char lastScannedUID[9]     = "None";
+unsigned long lastScanTime = 0;
 
-// Get UID as a lowercase string
-String getScannedUID() {
-    String uid = "";
-    for (byte i = 0; i < rfid.uid.size; i++) {
-        uid += String(rfid.uid.uidByte[i], HEX);
+// =============================================================================
+// UID helpers
+// =============================================================================
+
+/** Read the scanned card's UID into a zero-padded lowercase hex string. */
+void getUID(char* output) {
+    memset(output, 0, 9);
+    for (byte i = 0; i < rfid.uid.size && i < 4; i++) {
+        sprintf(output + i * 2, "%02x", rfid.uid.uidByte[i]);
     }
-    uid.toLowerCase();  // Ensure lowercase format
-    return uid;
 }
 
-// Check if UID is authorized
-bool isAuthorized(String scannedUID) {
-    for (int i = 0; i < numAuthorizedUIDs; i++) {
-        if (scannedUID == String(authorizedUIDs[i])) {
-            return true;
-        }
+/** Check whether a UID is in the AUTHORIZED_UIDS list from config.h. */
+bool isAuthorized(const char* uid) {
+    for (int i = 0; i < NUM_AUTHORIZED_UIDS; i++) {
+        if (strcmp(uid, AUTHORIZED_UIDS[i]) == 0) return true;
     }
     return false;
 }
 
-// Send HTTP request to Flask server
-bool sendToCloud(String endpoint, String scannedUID) {
+// =============================================================================
+// HTTP communication with Flask
+// =============================================================================
+
+/**
+ * Send a POST request to the Flask server.
+ * Auth token is sent as a custom header so it never appears in the URL.
+ * Returns true only on HTTP 200.
+ */
+bool sendToFlask(const char* endpoint, const char* uid) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[HTTP] No WiFi — skipping request.");
+        return false;
+    }
+
+    WiFiClient client;
     HTTPClient http;
-    String fullURL = String(cloudServer) + endpoint;
-    Serial.print("[HTTP] Sending to: ");
-    Serial.println(fullURL);
 
-    http.begin(fullURL);
+    String url = String(FLASK_SERVER_URL) + endpoint;
+    http.begin(client, url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(5000);  // ✅ Set reasonable timeout (5 sec)
+    http.addHeader("X-Auth-Token", AUTH_TOKEN);   // shared secret
+    http.setTimeout(5000);
 
-    String payload = "{\"uid\": \"" + scannedUID + "\"}";
-    int httpCode = http.POST(payload);
-    bool success = (httpCode == 200);
-
-    if (success) {
-        Serial.println("[HTTP] Success!");
-    } else {
-        Serial.print("[HTTP] Failed! Code: ");
-        Serial.println(httpCode);
-    }
-
+    String payload = "{\"uid\":\"" + String(uid) + "\"}";
+    int code = http.POST(payload);
+    String body = http.getString();
     http.end();
-    return success;
+
+    Serial.printf("[HTTP] %s → %d  %s\n", endpoint, code, body.c_str());
+    return (code == 200);
 }
 
-// Root web page
-void handleRoot() {
-    String html = "<html><head>"
-                  "<script>"
-                  "function updateStatus() {"
-                  " fetch('/rfid-status').then(response => response.text()).then(data => {"
-                  "   let parts = data.split(',');"
-                  "   document.getElementById('rfidDisplay').innerHTML = parts[0];"
-                  "   document.getElementById('statusDisplay').innerHTML = parts[1];"
-                  " });"
-                  "} setInterval(updateStatus, 1000);"
-                  "</script>"
-                  "</head><body>"
-                  "<h1>ESP32 Web Server</h1>"
-                  "<p>Last Scanned RFID: <b><span id='rfidDisplay'>" + lastScannedUID + "</span></b></p>"
-                  "<p>Recording Status: <b><span id='statusDisplay'>" + (isRecording ? "Recording in Progress" : "Stopped") + "</span></b></p>"
-                  "</body></html>";
+// =============================================================================
+// RFID scan handler
+// =============================================================================
 
-    server.send(200, "text/html", html);
-}
+void handleRFID() {
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
 
-// RFID status handler
-void handleRFIDStatus() {
-    server.send(200, "text/plain", lastScannedUID + "," + (isRecording ? "Recording in Progress" : "Stopped"));
-}
-
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n[ESP32] Booting...");
-
-    // Initialize RFID module
-    SPI.begin();
-    rfid.PCD_Init();
-    Serial.println("[ESP32] RFID Initialized.");
-
-    // WiFi Connection with timeout
-    WiFi.begin(ssid, password);
-    Serial.print("[WiFi] Connecting");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WiFi] Connected!");
-        Serial.print("[WiFi] IP Address: ");
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println("\n[WiFi] Connection Failed! Running offline...");
-    }
-
-    // Start web server
-    server.on("/", handleRoot);
-    server.on("/rfid-status", handleRFIDStatus);
-    server.begin();
-    Serial.println("[Server] Web Server Started!");
-}
-
-void loop() {
-    server.handleClient();
-
-    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    // Ignore rapid / accidental double-taps
+    unsigned long now = millis();
+    if (now - lastScanTime < SCAN_COOLDOWN_MS) {
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
         return;
     }
+    lastScanTime = now;
 
-    lastScannedUID = getScannedUID();
-    Serial.print("[RFID] Scanned UID: ");
-    Serial.println(lastScannedUID);
+    char uid[9];
+    getUID(uid);
+    strncpy(lastScannedUID, uid, 9);
+    Serial.printf("[RFID] Scanned: %s\n", uid);
 
-    if (!isAuthorized(lastScannedUID)) {
-        Serial.println("[RFID] Unauthorized UID! Access Denied.");
+    if (!isAuthorized(uid)) {
+        Serial.println("[RFID] Unauthorized card. Access denied.");
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
         return;
     }
 
     if (isRecording) {
-        if (lastScannedUID == activeUID) {
+        if (strcmp(uid, activeUID) == 0) {
+            // Same card that started the session — stop it
             Serial.println("[RFID] Stopping recording...");
-            isRecording = !sendToCloud("/stop", lastScannedUID);
-            activeUID = "";
+            if (sendToFlask("/stop", uid)) {
+                isRecording = false;
+                memset(activeUID, 0, 9);
+                Serial.println("[RFID] Recording stopped.");
+            } else {
+                Serial.println("[RFID] Stop request failed. Try again.");
+            }
         } else {
-            Serial.println("[RFID] Another ID is in progress. Please wait.");
+            // Different card tapped while a session is active
+            Serial.printf("[RFID] Session owned by %s — wait for it to end.\n", activeUID);
         }
     } else {
         Serial.println("[RFID] Starting recording...");
-        if (sendToCloud("/start", lastScannedUID)) {
+        if (sendToFlask("/start", uid)) {
             isRecording = true;
-            activeUID = lastScannedUID;
+            strncpy(activeUID, uid, 9);
+            Serial.printf("[RFID] Recording started. Session UID: %s\n", activeUID);
+        } else {
+            Serial.println("[RFID] Start request failed. Check server.");
         }
     }
 
-    delay(1000);
-
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
+}
+
+// =============================================================================
+// WiFi
+// =============================================================================
+
+void connectWiFi() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("[WiFi] Connecting");
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500);
+        Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\n[WiFi] Failed. Running in offline mode.");
+    }
+}
+
+// =============================================================================
+// Built-in web dashboard (served from the ESP32 itself)
+// =============================================================================
+
+void handleRoot() {
+    // Placeholders replaced after the raw string
+    String html = R"=====(<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RFID Recorder</title>
+<style>
+  body{font-family:sans-serif;max-width:480px;margin:2rem auto;padding:0 1rem}
+  h2{margin-bottom:1rem}
+  .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee}
+  .badge{padding:3px 10px;border-radius:10px;font-size:.85rem;font-weight:600}
+  .on{background:#d1fae5;color:#065f46}
+  .off{background:#f3f4f6;color:#374151}
+</style>
+<script>
+async function refresh() {
+  try {
+    const d = await (await fetch('/status')).json();
+    document.getElementById('uid').textContent    = d.uid;
+    document.getElementById('status').className   = 'badge ' + (d.recording ? 'on' : 'off');
+    document.getElementById('status').textContent = d.recording ? 'Recording' : 'Idle';
+  } catch(e) {}
+}
+setInterval(refresh, 1500);
+</script>
+</head><body>
+<h2>RFID Recorder</h2>
+<div class="row"><span>Last UID</span><b id="uid">)=====";
+
+    html += lastScannedUID;
+    html += R"=====(</b></div>
+<div class="row"><span>Status</span>
+<span id="status" class="badge )=====";
+    html += isRecording ? "on\">Recording" : "off\">Idle";
+    html += R"=====(</span></div>
+</body></html>)=====";
+
+    server.send(200, "text/html", html);
+}
+
+/** JSON endpoint polled by the dashboard's JS every 1.5 s */
+void handleStatus() {
+    String json = "{\"uid\":\"";
+    json += lastScannedUID;
+    json += "\",\"recording\":";
+    json += isRecording ? "true" : "false";
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+// =============================================================================
+// Setup & Loop
+// =============================================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    SPI.begin();
+    rfid.PCD_Init();
+    Serial.println("[ESP32] RFID initialized.");
+
+    connectWiFi();
+
+    server.on("/",       handleRoot);
+    server.on("/status", handleStatus);
+    server.begin();
+    Serial.println("[ESP32] Web server started.");
+}
+
+void loop() {
+    // Auto-reconnect if WiFi drops
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WiFi] Connection lost. Reconnecting...");
+        WiFi.reconnect();
+        delay(3000);
+    }
+
+    server.handleClient();
+    handleRFID();
 }
