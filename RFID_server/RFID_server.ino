@@ -4,79 +4,77 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// Define RFID module pins
 #define SS_PIN 5
 #define RST_PIN 22
 
-// WiFi credentials
 const char* ssid = "RS Raghu";
 const char* password = "6380779185";
 
 // Flask server address
-const char* cloudServer = "http://192.168.219.115:5000";
+const char* cloudServer = "http://192.168.114.115:5000";
 
-// List of authorized RFID UIDs
+// List of authorized RFID UIDs (normalized to lowercase)
 const char* authorizedUIDs[] = {
-    "53cb1229",  // Example UID 1
-    "aabbccdd",  // Example UID 2
-    "deadbeef"   // Example UID 3
+    "53cb1229", 
+    "aabbccdd", 
+    "faeebcdb"
 };
 const int numAuthorizedUIDs = sizeof(authorizedUIDs) / sizeof(authorizedUIDs[0]);
 
-// Initialize RFID and Web Server
 MFRC522 rfid(SS_PIN, RST_PIN);
 WebServer server(80);
 
 bool isRecording = false;
+String activeUID = "";
 String lastScannedUID = "None";
 
-// Function to get RFID UID as a string
+// Get UID as a lowercase string
 String getScannedUID() {
     String uid = "";
     for (byte i = 0; i < rfid.uid.size; i++) {
         uid += String(rfid.uid.uidByte[i], HEX);
     }
+    uid.toLowerCase();  // Ensure lowercase format
     return uid;
 }
 
-// Function to check if scanned UID is authorized
+// Check if UID is authorized
 bool isAuthorized(String scannedUID) {
     for (int i = 0; i < numAuthorizedUIDs; i++) {
-        if (scannedUID.equalsIgnoreCase(authorizedUIDs[i])) {
+        if (scannedUID == String(authorizedUIDs[i])) {
             return true;
         }
     }
     return false;
 }
 
-// Function to send HTTP request to Flask server
+// Send HTTP request to Flask server
 bool sendToCloud(String endpoint, String scannedUID) {
     HTTPClient http;
     String fullURL = String(cloudServer) + endpoint;
-
     Serial.print("[HTTP] Sending to: ");
     Serial.println(fullURL);
 
     http.begin(fullURL);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);  // Increase timeout for slow networks
+    http.setTimeout(5000);  // ✅ Set reasonable timeout (5 sec)
 
     String payload = "{\"uid\": \"" + scannedUID + "\"}";
     int httpCode = http.POST(payload);
+    bool success = (httpCode == 200);
 
-    if (httpCode == 200) {  // Ensure only successful responses count
-        Serial.println("[HTTP] Recording toggled successfully!");
-        http.end();
-        return true;
+    if (success) {
+        Serial.println("[HTTP] Success!");
     } else {
-        Serial.print("[HTTP] Request Failed! Code: ");
+        Serial.print("[HTTP] Failed! Code: ");
         Serial.println(httpCode);
-        http.end();
-        return false;
     }
+
+    http.end();
+    return success;
 }
 
-// Handle root web page
+// Root web page
 void handleRoot() {
     String html = "<html><head>"
                   "<script>"
@@ -104,8 +102,7 @@ void handleRFIDStatus() {
 
 void setup() {
     Serial.begin(115200);
-    delay(2000);
-
+    delay(1000);
     Serial.println("\n[ESP32] Booting...");
 
     // Initialize RFID module
@@ -113,18 +110,24 @@ void setup() {
     rfid.PCD_Init();
     Serial.println("[ESP32] RFID Initialized.");
 
-    // Connect to WiFi
+    // WiFi Connection with timeout
     WiFi.begin(ssid, password);
-    Serial.print("[WiFi] Connecting...");
-    while (WiFi.status() != WL_CONNECTED) {
+    Serial.print("[WiFi] Connecting");
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
         delay(500);
         Serial.print(".");
+        attempts++;
     }
-    Serial.println("\n[WiFi] Connected!");
-    Serial.print("[WiFi] IP Address: ");
-    Serial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[WiFi] Connected!");
+        Serial.print("[WiFi] IP Address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\n[WiFi] Connection Failed! Running offline...");
+    }
 
-    // Setup web server
+    // Start web server
     server.on("/", handleRoot);
     server.on("/rfid-status", handleRFIDStatus);
     server.begin();
@@ -147,9 +150,23 @@ void loop() {
         return;
     }
 
-    isRecording = !isRecording ? sendToCloud("/start", lastScannedUID) : !sendToCloud("/stop", lastScannedUID);
+    if (isRecording) {
+        if (lastScannedUID == activeUID) {
+            Serial.println("[RFID] Stopping recording...");
+            isRecording = !sendToCloud("/stop", lastScannedUID);
+            activeUID = "";
+        } else {
+            Serial.println("[RFID] Another ID is in progress. Please wait.");
+        }
+    } else {
+        Serial.println("[RFID] Starting recording...");
+        if (sendToCloud("/start", lastScannedUID)) {
+            isRecording = true;
+            activeUID = lastScannedUID;
+        }
+    }
 
-    delay(2000);  // Prevent multiple rapid scans
+    delay(1000);
 
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
