@@ -2,7 +2,7 @@
 server.py — Flask recording server
 
 Receives /start and /stop from the ESP32, records audio via sounddevice,
-and saves .wav files organised by teacher UID.
+and saves .wav files named  uid_YYYYMMDD_HHMMSS.wav  inside recordings/<uid>/.
 
 Setup:
     pip install flask sounddevice numpy python-dotenv
@@ -18,6 +18,7 @@ from flask import Flask, request, jsonify
 from threading import Thread, Lock
 from functools import wraps
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()
 
@@ -44,6 +45,7 @@ _state = {
     "active":     False,
     "frames":     [],
     "teacher_id": None,
+    "start_time": None,   # datetime captured at /start — used for filename
     "status":     "Idle",
 }
 
@@ -63,14 +65,16 @@ def require_auth(f):
 # ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
-def get_next_filename(teacher_id: str) -> str:
-    """Return the next non-existing path like recordings/<uid>/<uid>3.wav."""
+def build_filename(teacher_id: str, start_time: datetime) -> str:
+    """
+    Build a path like:
+        recordings/53cb1229/53cb1229_20260329_220513.wav
+    The timestamp is the moment recording STARTED, not when it was saved.
+    """
     folder = os.path.join(BASE_RECORDINGS_FOLDER, teacher_id)
     os.makedirs(folder, exist_ok=True)
-    i = 1
-    while os.path.exists(os.path.join(folder, f"{teacher_id}{i}.wav")):
-        i += 1
-    return os.path.join(folder, f"{teacher_id}{i}.wav")
+    timestamp = start_time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(folder, f"{teacher_id}_{timestamp}.wav")
 
 # ---------------------------------------------------------------------------
 # Audio recording (runs in a background thread)
@@ -92,14 +96,15 @@ def _record_thread():
 def _save_recording() -> str | None:
     """Concatenate buffered frames and write to disk. Returns the file path or None."""
     with _lock:
-        frames     = list(_state["frames"])
-        teacher_id = _state["teacher_id"]
+        frames      = list(_state["frames"])
+        teacher_id  = _state["teacher_id"]
+        start_time  = _state["start_time"]
 
-    if not frames or not teacher_id:
+    if not frames or not teacher_id or not start_time:
         return None
 
     audio = np.concatenate(frames, axis=0)
-    path  = get_next_filename(teacher_id)
+    path  = build_filename(teacher_id, start_time)
 
     with wave.open(path, "wb") as wf:
         wf.setnchannels(CHANNELS)
@@ -127,10 +132,11 @@ def start_recording_api():
         _state["active"]     = True
         _state["frames"]     = []
         _state["teacher_id"] = uid
+        _state["start_time"] = datetime.now()
         _state["status"]     = f"Recording | UID: {uid}"
 
     Thread(target=_record_thread, daemon=True).start()
-    print(f"[Server] Recording started for UID: {uid}")
+    print(f"[Server] Recording started — UID: {uid}")
     return jsonify({"message": "Recording started", "uid": uid}), 200
 
 
@@ -146,11 +152,8 @@ def stop_recording_api():
     with _lock:
         if not _state["active"]:
             return jsonify({"error": "No recording is currently active"}), 409
-
-        # Only the card that started the session can stop it
         if _state["teacher_id"] != uid:
             return jsonify({"error": "UID mismatch — this card did not start the session"}), 403
-
         _state["active"] = False
         _state["status"] = "Saving..."
 
@@ -158,6 +161,7 @@ def stop_recording_api():
 
     with _lock:
         _state["teacher_id"] = None
+        _state["start_time"] = None
         if file_path:
             _state["status"] = f"Saved: {os.path.basename(file_path)}"
         else:
@@ -172,18 +176,18 @@ def stop_recording_api():
 
 @app.route("/status", methods=["GET"])
 def status_api():
-    """Unauthenticated read-only endpoint for dashboards and health checks."""
+    """Unauthenticated read-only endpoint — polled by the dashboard JS."""
     with _lock:
         return jsonify({
             "status":     _state["status"],
             "recording":  _state["active"],
-            "teacher_id": _state["teacher_id"],
+            "teacher_id": _state["teacher_id"] or "—",
         }), 200
 
 
 @app.route("/", methods=["GET"])
 def homepage():
-    """Simple auto-refreshing dashboard — open in any browser on the same network."""
+    """Live dashboard — all fields update every 2 s via JS fetch, no page reload needed."""
     with _lock:
         status     = _state["status"]
         teacher_id = _state["teacher_id"] or "—"
@@ -198,27 +202,50 @@ def homepage():
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Recording Server</title>
 <style>
-  body{{font-family:sans-serif;max-width:480px;margin:2rem auto;padding:0 1rem}}
-  .row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee}}
-  .badge{{padding:3px 10px;border-radius:10px;font-size:.85rem;font-weight:600}}
-  .on{{background:#d1fae5;color:#065f46}} .off{{background:#f3f4f6;color:#374151}}
+  body{{font-family:sans-serif;max-width:500px;margin:2rem auto;padding:0 1rem}}
+  h2{{margin-bottom:1rem}}
+  .row{{display:flex;justify-content:space-between;align-items:center;
+        padding:10px 0;border-bottom:1px solid #e5e7eb}}
+  .label{{color:#6b7280;font-size:.9rem}}
+  .badge{{padding:3px 12px;border-radius:10px;font-size:.85rem;font-weight:600}}
+  .on{{background:#d1fae5;color:#065f46}}
+  .off{{background:#f3f4f6;color:#374151}}
+  .dot{{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}}
+  .dot-on{{background:#10b981}} .dot-off{{background:#9ca3af}}
 </style>
 <script>
 async function refresh() {{
-  const d = await (await fetch('/status')).json();
-  document.getElementById('status').textContent  = d.status;
-  document.getElementById('uid').textContent     = d.teacher_id ?? '—';
-  const b = document.getElementById('badge');
-  b.textContent = d.recording ? 'Recording' : 'Idle';
-  b.className   = 'badge ' + (d.recording ? 'on' : 'off');
+  try {{
+    const d = await (await fetch('/status')).json();
+    document.getElementById('uid').textContent    = d.teacher_id;
+    document.getElementById('status-text').textContent = d.status;
+    const badge = document.getElementById('badge');
+    const dot   = document.getElementById('dot');
+    badge.textContent = d.recording ? 'Recording' : 'Idle';
+    badge.className   = 'badge ' + (d.recording ? 'on' : 'off');
+    dot.className     = 'dot '  + (d.recording ? 'dot-on' : 'dot-off');
+  }} catch(e) {{}}
 }}
 setInterval(refresh, 2000);
+refresh();
 </script>
 </head><body>
 <h2>Recording Server</h2>
-<div class="row"><span>Status</span><span>{status}</span></div>
-<div class="row"><span>Teacher UID</span><b id="uid">{teacher_id}</b></div>
-<div class="row"><span>Recording</span><span id="badge" class="badge {badge_class}">{badge_label}</span></div>
+<div class="row">
+  <span class="label">Status</span>
+  <span id="status-text">{status}</span>
+</div>
+<div class="row">
+  <span class="label">Teacher UID</span>
+  <b id="uid">{teacher_id}</b>
+</div>
+<div class="row">
+  <span class="label">Recording</span>
+  <span>
+    <span id="dot" class="dot {'dot-on' if active else 'dot-off'}"></span>
+    <span id="badge" class="badge {badge_class}">{badge_label}</span>
+  </span>
+</div>
 </body></html>"""
 
 
@@ -226,6 +253,6 @@ setInterval(refresh, 2000);
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # debug=False is important — Flask's reloader spawns a second process which
-    # would open a second audio stream and cause conflicts.
+    # debug=False — the reloader would spawn a second process and open a
+    # competing audio stream.
     app.run(host="0.0.0.0", port=5000, debug=False)

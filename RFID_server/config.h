@@ -6,7 +6,7 @@
 #define WIFI_PASSWORD "6380779185"
 
 // ----- Flask server -----
-#define FLASK_SERVER_URL "http://10.236.162.115"
+#define FLASK_SERVER_URL "http://10.236.162.115:5000"
 
 // Shared secret — must match FLASK_AUTH_TOKEN in your .env file
 // Generate one: python -c "import secrets; print(secrets.token_hex(32))"
