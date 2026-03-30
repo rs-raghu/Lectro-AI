@@ -1,0 +1,1 @@
+Embedded system is a specialized computing device designed for a dedicated function, combining hardware and software. Unlike general purpose computers, they are integrated within larger mechanical or electronic system to control specific tasks.

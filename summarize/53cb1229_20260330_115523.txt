@@ -1,0 +1,12 @@
+Here's a summary of the lecture transcript:
+
+### Embedded Systems: Core Definition
+
+*   **Specialized Computing Device:** An embedded system is a computing device built for a very specific purpose.
+*   **Hardware-Software Integration:** It combines both hardware and software components.
+*   **Dedicated Function:** Designed to perform one particular function or set of functions.
+
+### Key Characteristics & Distinctions
+
+*   **Integrated Role:** Unlike general-purpose computers (like PCs), embedded systems are integrated *within* a larger mechanical or electronic system.
+*   **Specific Task Control:** Its primary role is to control specific, dedicated tasks within that larger system.

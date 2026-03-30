@@ -1,0 +1,1 @@
+Machine learning is an artificial intelligence that enables system to learn from data and improve performance over time without being explicitly programmed. It uses algorithm to identify patterns in data, making predictions or automating tasks like fraud detection or recommendations that traditionally ruled based programming cannot handle efficiently.
