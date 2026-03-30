@@ -1,5 +1,5 @@
 # Secrets
-config.h
+RFID_server/config.h
 Server/.env
 
 # Generated data folders
