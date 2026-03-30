@@ -1,6 +1,6 @@
 # Secrets
 config.h
-.env
+Server/.env
 
 # Generated data folders
 recordings/
